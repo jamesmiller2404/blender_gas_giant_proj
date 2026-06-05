@@ -1,5 +1,5 @@
 """
-Gas Giant Shader Controls v11 - safer Blender add-on/script with per-layer cloud and swirl controls
+Gas Giant Shader Controls v12 - full per-layer cloud and swirl control wiring
 
 This version is meant to fix the failed v2 build.
 
@@ -26,9 +26,9 @@ Usage:
 """
 
 bl_info = {
-    "name": "Gas Giant Shader Controls v11",
+    "name": "Gas Giant Shader Controls v12",
     "author": "ChatGPT for James Miller",
-    "version": (11, 1, 0),
+    "version": (12, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Gas Giant",
     "description": "Safer 6-layer gas giant shader controller with presets, atmosphere, and per-layer cloud structure/swirl controls.",
@@ -57,7 +57,7 @@ SWIRL_TIGHTNESS_GAIN = 3.25
 SWIRL_NOISE_DISTORTION_GAIN = 4.0
 COLOR_SATURATION_GAIN = 1.25
 COLOR_BRIGHTNESS_GAIN = 1.08
-TUNING_VERSION_PROP = 'v11_detail_swirl_color_tuning'
+TUNING_VERSION_PROP = 'v12_full_per_layer_wiring_tuning'
 
 PRESET_DATA = [
     ("saturn_gold_bands", "Saturn Gold Bands", [(0.97,0.94,0.78,1),(0.93,0.84,0.58,1),(0.84,0.69,0.42,1),(0.95,0.89,0.70,1),(0.71,0.57,0.34,1),(0.99,0.97,0.88,1)], 16, 7.5, .42, .42, [.18,.25,.38,.45,.52,.62], .50, .92, 1.02),
@@ -505,8 +505,40 @@ def build_rig(context):
     link(nt, color_output, base_input)
 
     mat['gas_giant_controller'] = ctrl.name
-    mat['gas_giant_v11_note'] = 'Built by Gas Giant Shader Controls v11. Six cloud layers are driven by independent per-layer structure properties.'
+    mat['gas_giant_v11_note'] = 'Built by Gas Giant Shader Controls v12. Six cloud layers are driven by independent per-layer structure properties.'
     return mat.name
+
+
+def push_global_defaults_to_layers(ctrl):
+    """Copy the legacy/global controls into the six independent layer controls.
+
+    The global properties remain useful as broad starting values, but the actual
+    shader nodes are driven by layer_N_* properties. This function is only a
+    convenience reset/sync operation; it does not create shared live wiring.
+    """
+    setup_controller(ctrl)
+    base_scale = float(ctrl.get('cloud_scale', 18.0))
+    base_complexity = float(ctrl.get('cloud_complexity', 9.0))
+    base_roughness = float(ctrl.get('cloud_roughness', 0.56))
+    base_contrast = float(ctrl.get('cloud_contrast', 0.55))
+    base_opacity = float(ctrl.get('cloud_opacity', 0.62))
+    base_tightness = float(ctrl.get('swirl_tightness', 0.32))
+    base_curvature = float(ctrl.get('swirl_curvature', 0.25))
+    base_swirl_scale = float(ctrl.get('swirl_scale', 6.0))
+    base_offset = float(ctrl.get('swirl_offset', 0.0))
+    variation = float(ctrl.get('swirl_layer_variation', 0.35))
+
+    for i, scale_mult in enumerate(LAYER_SCALE_MULTS, 1):
+        layer_center = i - 3.5
+        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, base_scale * scale_mult)
+        ctrl[f'layer_{i}_cloud_complexity'] = base_complexity
+        ctrl[f'layer_{i}_cloud_roughness'] = base_roughness
+        ctrl[f'layer_{i}_cloud_contrast'] = base_contrast
+        ctrl[f'layer_{i}_cloud_opacity'] = base_opacity
+        ctrl[f'layer_{i}_swirl_tightness'] = max(0.0, min(2.0, base_tightness * (0.75 + i * 0.12 + variation * 0.12)))
+        ctrl[f'layer_{i}_swirl_curvature'] = max(-1.0, min(1.0, base_curvature + layer_center * 0.10 * max(0.2, variation)))
+        ctrl[f'layer_{i}_swirl_scale'] = max(0.1, base_swirl_scale * (0.75 + i * 0.10))
+        ctrl[f'layer_{i}_swirl_offset'] = base_offset + i * (0.13 + variation * 0.05)
 
 
 def apply_preset(ctrl, key):
@@ -520,16 +552,25 @@ def apply_preset(ctrl, key):
     ctrl['cloud_roughness'] = rough
     ctrl['cloud_contrast'] = contrast
     ctrl['cloud_opacity'] = 0.62
-    for i, val in enumerate(layers, 1):
-        ctrl[f'layer_{i}_strength'] = val
-        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, scale * LAYER_SCALE_MULTS[i-1])
-        ctrl[f'layer_{i}_cloud_complexity'] = detail
-        ctrl[f'layer_{i}_cloud_roughness'] = rough
-        ctrl[f'layer_{i}_cloud_contrast'] = contrast
-        ctrl[f'layer_{i}_cloud_opacity'] = 0.62
     ctrl['hue_shift'] = hue
     ctrl['saturation'] = max(1.18, sat)
     ctrl['brightness'] = max(1.06, bright)
+
+    # Presets now refresh both cloud structure and swirl/curvature per layer.
+    # This keeps the preset from leaving stale per-layer swirl values behind.
+    for i, val in enumerate(layers, 1):
+        layer_center = i - 3.5
+        alternating = -1.0 if i % 2 else 1.0
+        ctrl[f'layer_{i}_strength'] = val
+        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, scale * LAYER_SCALE_MULTS[i-1])
+        ctrl[f'layer_{i}_cloud_complexity'] = detail * (0.92 + i * 0.025)
+        ctrl[f'layer_{i}_cloud_roughness'] = max(0.0, min(1.0, rough + layer_center * 0.018))
+        ctrl[f'layer_{i}_cloud_contrast'] = max(0.0, min(1.0, contrast + layer_center * 0.025))
+        ctrl[f'layer_{i}_cloud_opacity'] = 0.58 + min(0.22, val * 0.18)
+        ctrl[f'layer_{i}_swirl_tightness'] = max(0.0, min(2.0, (rough + contrast) * (0.45 + i * 0.085)))
+        ctrl[f'layer_{i}_swirl_curvature'] = max(-1.0, min(1.0, alternating * (0.12 + contrast * 0.42 + i * 0.035)))
+        ctrl[f'layer_{i}_swirl_scale'] = max(0.1, scale * (0.28 + i * 0.115))
+        ctrl[f'layer_{i}_swirl_offset'] = i * 0.17 + contrast * 0.35
 
 
 
@@ -663,7 +704,7 @@ def build_atmosphere(context):
     clear_input(nt, surface_input)
     link(nt, shader_output_socket(add), surface_input)
 
-    mat['gas_giant_atmosphere_note'] = 'Visible atmospheric edge/rim glow added by Gas Giant Shader Controls v11.'
+    mat['gas_giant_atmosphere_note'] = 'Visible atmospheric edge/rim glow added by Gas Giant Shader Controls v12.'
     return mat.name
 
 
@@ -813,7 +854,7 @@ def build_swirl_warp(context):
         clear_input(nt, noise.inputs['Vector']); link(nt, add.outputs[0], noise.inputs['Vector'])
         wired += 1
 
-    mat['gas_giant_swirl_note'] = f'Independent per-layer swirl warp node rig added by Gas Giant Shader Controls v11; wired {wired} cloud noise nodes.'
+    mat['gas_giant_swirl_note'] = f'Independent per-layer swirl warp node rig added by Gas Giant Shader Controls v12; wired {wired} cloud noise nodes.'
     return mat.name, wired
 
 
@@ -849,16 +890,63 @@ class GASGIANT_OT_diagnostics(bpy.types.Operator):
 
 class GASGIANT_OT_build(bpy.types.Operator):
     bl_idname = 'gasgiant.build_v3'
-    bl_label = 'Build / Repair 6-Layer Rig'
+    bl_label = 'Build / Repair Full 6-Layer Rig'
+    bl_description = 'Build the six cloud layers and wire independent per-layer swirl/curvature controls into each layer'
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         try:
             mat_name = build_rig(context)
+            _, wired = build_swirl_warp(context)
         except Exception as e:
             self.report({'ERROR'}, str(e))
-            print('Gas Giant v3 error:', repr(e))
+            print('Gas Giant v12 build error:', repr(e))
             return {'CANCELLED'}
-        self.report({'INFO'}, f'Built 6-layer rig on material: {mat_name}')
+        self.report({'INFO'}, f'Built full per-layer rig on {mat_name}; wired {wired} independent swirl layers.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_push_globals(bpy.types.Operator):
+    bl_idname = 'gasgiant.push_globals_to_layers_v12'
+    bl_label = 'Push Global Defaults To Layers'
+    bl_description = 'Copy global cloud/swirl values into each layer as independent starting values'
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        ctrl = find_controller()
+        push_global_defaults_to_layers(ctrl)
+        self.report({'INFO'}, 'Copied global values into independent per-layer controls.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_validate_wiring(bpy.types.Operator):
+    bl_idname = 'gasgiant.validate_per_layer_wiring_v12'
+    bl_label = 'Validate Per-Layer Wiring'
+    bl_description = 'Check that each GG Noise node receives its vector input from its matching per-layer warp chain'
+    bl_options = {'REGISTER'}
+    def execute(self, context):
+        mat = find_material(context)
+        if not mat:
+            self.report({'ERROR'}, 'No likely node material found. Select the planet object first.')
+            return {'CANCELLED'}
+        nt = mat.node_tree
+        problems = []
+        for i in range(1, 7):
+            noise = nt.nodes.get(f'GG Noise {i}')
+            expected = f'GG Swirl Layer Add Warp {i}'
+            if not noise:
+                problems.append(f'GG Noise {i} missing')
+                continue
+            if 'Vector' not in noise.inputs or not noise.inputs['Vector'].is_linked:
+                problems.append(f'GG Noise {i} Vector not linked')
+                continue
+            source_node = noise.inputs['Vector'].links[0].from_node
+            if source_node.name != expected:
+                problems.append(f'GG Noise {i} Vector linked from {source_node.name}, expected {expected}')
+        if problems:
+            for problem in problems:
+                print('Gas Giant v12 wiring problem:', problem)
+            self.report({'WARNING'}, f'Per-layer wiring has {len(problems)} issue(s). See console.')
+        else:
+            self.report({'INFO'}, 'All six cloud layers are wired to their matching independent swirl chains.')
         return {'FINISHED'}
 
 
@@ -944,7 +1032,7 @@ class GASGIANT_OT_select_ctrl(bpy.types.Operator):
 
 
 class GASGIANT_PT_panel(bpy.types.Panel):
-    bl_label = 'Shader Controls v11'
+    bl_label = 'Shader Controls v12'
     bl_idname = 'GASGIANT_PT_shader_controls_v6'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -956,6 +1044,7 @@ class GASGIANT_PT_panel(bpy.types.Panel):
         row.operator('gasgiant.diagnostics_v3', icon='INFO')
         row.operator('gasgiant.select_ctrl_v3', icon='EMPTY_AXIS')
         layout.operator('gasgiant.build_v3', icon='NODETREE')
+        layout.operator('gasgiant.validate_per_layer_wiring_v12', icon='CHECKMARK')
         layout.operator('gasgiant.build_atmosphere_v5', icon='WORLD')
         layout.operator('gasgiant.test_atmosphere_v5', icon='LIGHT_HEMI')
         layout.operator('gasgiant.build_swirl_v6', icon='MOD_WARP')
@@ -968,6 +1057,10 @@ class GASGIANT_PT_panel(bpy.types.Panel):
             layout.label(text='Controller appears after build or preset.', icon='INFO')
             return
         setup_controller(ctrl)
+        box = layout.box(); box.label(text='Global Defaults / Utilities')
+        box.operator('gasgiant.push_globals_to_layers_v12', icon='FILE_REFRESH')
+        for name in ['cloud_scale','cloud_complexity','cloud_roughness','cloud_contrast','cloud_opacity','swirl_tightness','swirl_curvature','swirl_scale','swirl_offset','swirl_layer_variation']:
+            box.prop(ctrl, f'["{name}"]', text=name.replace('_',' ').title())
         box = layout.box(); box.label(text='Palette')
         for i in range(1,7):
             box.prop(ctrl, f'["band_color_{i}"]', text=f'Color {i}')
@@ -1003,6 +1096,8 @@ class GASGIANT_PT_panel(bpy.types.Panel):
 CLASSES = [
     GASGIANT_OT_diagnostics,
     GASGIANT_OT_build,
+    GASGIANT_OT_push_globals,
+    GASGIANT_OT_validate_wiring,
     GASGIANT_OT_build_atmosphere,
     GASGIANT_OT_test_atmosphere,
     GASGIANT_OT_build_swirl,
@@ -1041,4 +1136,4 @@ def unregister():
 
 if __name__ == '__main__':
     register()
-    print('Gas Giant Shader Controls v11 registered. Press N > Gas Giant > Diagnostics, then Build / Repair 6-Layer Rig, Build / Repair Atmosphere Edge, or Build / Repair Per-Layer Swirl Warp.')
+    print('Gas Giant Shader Controls v12 registered. Press N > Gas Giant > Diagnostics, then Build / Repair Full 6-Layer Rig, then optionally Build / Repair Atmosphere Edge or Validate Per-Layer Wiring.')

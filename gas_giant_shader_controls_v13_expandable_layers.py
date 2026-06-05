@@ -1,17 +1,17 @@
 """
-Gas Giant Shader Controls v11 - safer Blender add-on/script with per-layer cloud and swirl controls
+Gas Giant Shader Controls v13 - expandable per-layer cloud stack
 
 This version is meant to fix the failed v2 build.
 
 Key changes:
 - Does NOT auto-build the shader rig when you run the script. It only registers the UI.
 - Adds a Diagnostics button so you can see what material/object Blender detected.
-- Builds a 6-layer cloud rig only when you click the button.
+- Starts with one cloud layer and lets the user add one cloud layer at a time.
 - Uses safer socket lookup and avoids fragile hard-coded Hue/Saturation input indexes.
 - Uses simple driver expressions only.
 - Creates 25 gas giant / ice giant / hot Jupiter / Hycean presets.
 - Adds optional planet-edge atmospheric limb/rim nodes with user controls.
-- Adds independent structure and swirl controls for each of the six cloud layers.
+- Adds independent structure and swirl controls for each active cloud layer.
 
 Usage:
 1. Open your .blend file.
@@ -21,24 +21,25 @@ Usage:
 5. Press N in the 3D Viewport.
 6. Go to Gas Giant.
 7. Click Diagnostics first.
-8. Click Build / Repair 6-Layer Rig.
-9. Choose a preset and click Apply Preset.
+8. Click Build / Repair Active Layer Stack.
+9. Click Add Cloud Layer whenever you want another layer.
+10. Choose a preset and click Apply Preset.
 """
 
 bl_info = {
-    "name": "Gas Giant Shader Controls v11",
+    "name": "Gas Giant Shader Controls v13",
     "author": "ChatGPT for James Miller",
-    "version": (11, 1, 0),
+    "version": (13, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Gas Giant",
-    "description": "Safer 6-layer gas giant shader controller with presets, atmosphere, and per-layer cloud structure/swirl controls.",
+    "description": "Expandable gas giant shader controller with add-one-layer workflow, presets, atmosphere, and per-layer cloud/swirl controls.",
     "category": "Material",
 }
 
 import bpy
 
 CONTROLLER_NAME = "Gas Giant Shader Controls"
-FRAME_NAME = "GG 6-Layer Cloud Rig"
+FRAME_NAME = "GG Expandable Cloud Layer Rig"
 ATM_FRAME_NAME = "GG Atmospheric Edge Rig"
 SWIRL_FRAME_NAME = "GG Cloud Swirl Warp Rig"
 
@@ -57,7 +58,9 @@ SWIRL_TIGHTNESS_GAIN = 3.25
 SWIRL_NOISE_DISTORTION_GAIN = 4.0
 COLOR_SATURATION_GAIN = 1.25
 COLOR_BRIGHTNESS_GAIN = 1.08
-TUNING_VERSION_PROP = 'v11_detail_swirl_color_tuning'
+TUNING_VERSION_PROP = 'v13_expandable_layer_stack_tuning'
+MAX_CLOUD_LAYERS = 24
+ACTIVE_LAYER_PROP = 'active_cloud_layers'
 
 PRESET_DATA = [
     ("saturn_gold_bands", "Saturn Gold Bands", [(0.97,0.94,0.78,1),(0.93,0.84,0.58,1),(0.84,0.69,0.42,1),(0.95,0.89,0.70,1),(0.71,0.57,0.34,1),(0.99,0.97,0.88,1)], 16, 7.5, .42, .42, [.18,.25,.38,.45,.52,.62], .50, .92, 1.02),
@@ -118,81 +121,185 @@ def set_prop(obj, name, value, desc='', min_value=None, max_value=None, subtype=
         pass
 
 
+def clamp_int(value, low, high):
+    try:
+        value = int(value)
+    except Exception:
+        value = low
+    return max(low, min(high, value))
+
+
+def get_active_layer_count(ctrl=None):
+    ctrl = ctrl or find_controller()
+    return clamp_int(ctrl.get(ACTIVE_LAYER_PROP, 1), 1, MAX_CLOUD_LAYERS)
+
+
+def set_active_layer_count(ctrl, count):
+    count = clamp_int(count, 1, MAX_CLOUD_LAYERS)
+    ctrl[ACTIVE_LAYER_PROP] = count
+    try:
+        ctrl.id_properties_ui(ACTIVE_LAYER_PROP).update(
+            description='Number of active procedural cloud layers in the stack',
+            min=1, max=MAX_CLOUD_LAYERS, soft_min=1, soft_max=MAX_CLOUD_LAYERS
+        )
+    except Exception:
+        pass
+    return count
+
+
+def palette_color_for_layer(index):
+    return DEFAULT_PALETTE[(index - 1) % len(DEFAULT_PALETTE)]
+
+
+def scale_mult_for_layer(index):
+    if index <= len(LAYER_SCALE_MULTS):
+        return LAYER_SCALE_MULTS[index - 1]
+    # Continue increasing scale gently for layers above the original six.
+    return LAYER_SCALE_MULTS[-1] * (1.22 ** (index - len(LAYER_SCALE_MULTS)))
+
+
+def layer_prop_names(index):
+    return [
+        f'band_color_{index}',
+        f'layer_{index}_strength',
+        f'layer_{index}_cloud_scale',
+        f'layer_{index}_cloud_complexity',
+        f'layer_{index}_cloud_roughness',
+        f'layer_{index}_cloud_contrast',
+        f'layer_{index}_cloud_opacity',
+        f'layer_{index}_swirl_tightness',
+        f'layer_{index}_swirl_curvature',
+        f'layer_{index}_swirl_scale',
+        f'layer_{index}_swirl_offset',
+    ]
+
+
+def layer_node_names(index):
+    return [
+        f'GG Noise {index}',
+        f'GG Mask Ramp {index}',
+        f'GG Strength {index}',
+        f'GG Cloud Opacity {index}',
+        f'GG Layer Color {index}',
+        f'GG Layer Mix {index}',
+        f'GG Swirl Layer Mapping {index}',
+        f'GG Swirl Layer Warp Noise {index}',
+        f'GG Swirl Layer Center Noise {index}',
+        f'GG Swirl Layer Tightness Scale {index}',
+        f'GG Swirl Layer Add Warp {index}',
+    ]
+
+
+def remove_layers_above(nt, active_count):
+    # Keep the node tree tidy when the user reduces the active layer count.
+    for i in range(active_count + 1, MAX_CLOUD_LAYERS + 1):
+        for name in layer_node_names(i):
+            node = nt.nodes.get(name)
+            if node:
+                try:
+                    nt.nodes.remove(node)
+                except Exception:
+                    pass
+
+
+def ensure_layer_properties(ctrl, index):
+    base_scale = float(ctrl.get('cloud_scale', 18.0))
+    base_complexity = float(ctrl.get('cloud_complexity', 9.0))
+    base_roughness = float(ctrl.get('cloud_roughness', 0.56))
+    base_contrast = float(ctrl.get('cloud_contrast', 0.55))
+    base_opacity = float(ctrl.get('cloud_opacity', 0.62))
+    base_tightness = float(ctrl.get('swirl_tightness', 0.32))
+    base_curvature = float(ctrl.get('swirl_curvature', 0.25))
+    base_swirl_scale = float(ctrl.get('swirl_scale', 6.0))
+    base_offset = float(ctrl.get('swirl_offset', 0.0))
+    layer_center = index - ((MAX_CLOUD_LAYERS + 1) / 2.0)
+    defaults = {
+        f'band_color_{index}': list(palette_color_for_layer(index)),
+        f'layer_{index}_strength': 0.22 if index == 1 else max(0.08, min(0.85, 0.24 + index * 0.055)),
+        f'layer_{index}_cloud_scale': max(0.1, base_scale * scale_mult_for_layer(index)),
+        f'layer_{index}_cloud_complexity': base_complexity,
+        f'layer_{index}_cloud_roughness': base_roughness,
+        f'layer_{index}_cloud_contrast': base_contrast,
+        f'layer_{index}_cloud_opacity': base_opacity,
+        f'layer_{index}_swirl_tightness': max(0.0, min(2.0, base_tightness * (0.70 + index * 0.12))),
+        f'layer_{index}_swirl_curvature': max(-1.0, min(1.0, base_curvature + (index - 1) * 0.05)),
+        f'layer_{index}_swirl_scale': max(0.1, base_swirl_scale * (0.80 + index * 0.08)),
+        f'layer_{index}_swirl_offset': base_offset + index * 0.11,
+    }
+    for k, v in defaults.items():
+        if k not in ctrl:
+            subtype = 'COLOR' if k.startswith('band_color_') else None
+            set_prop(ctrl, k, v, k.replace('_', ' ').title(), 0.0, 1.0, subtype)
+
+    # UI metadata / useful ranges.
+    try:
+        ctrl.id_properties_ui(f'band_color_{index}').update(subtype='COLOR', min=0, max=1, soft_min=0, soft_max=1)
+    except Exception:
+        pass
+    for prop_name, min_value, max_value, soft_max in [
+        (f'layer_{index}_cloud_scale', 0.1, 250.0, 80.0),
+        (f'layer_{index}_cloud_complexity', 0.0, 15.0, 15.0),
+        (f'layer_{index}_cloud_roughness', 0.0, 1.0, 1.0),
+        (f'layer_{index}_cloud_contrast', 0.0, 1.0, 1.0),
+        (f'layer_{index}_cloud_opacity', 0.0, 1.0, 1.0),
+        (f'layer_{index}_strength', 0.0, 1.0, 1.0),
+    ]:
+        try:
+            ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=soft_max)
+        except Exception:
+            pass
+    for prop_name, min_value, max_value in [
+        (f'layer_{index}_swirl_tightness', 0.0, 2.0),
+        (f'layer_{index}_swirl_curvature', -1.0, 1.0),
+        (f'layer_{index}_swirl_scale', 0.1, 50.0),
+        (f'layer_{index}_swirl_offset', -10.0, 10.0),
+    ]:
+        try:
+            ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=max_value)
+        except Exception:
+            pass
+
+
 def setup_controller(ctrl):
-    for i, color in enumerate(DEFAULT_PALETTE, 1):
-        if f'band_color_{i}' not in ctrl:
-            set_prop(ctrl, f'band_color_{i}', list(color), f'Band/cloud color {i}', 0, 1, 'COLOR')
+    if ACTIVE_LAYER_PROP not in ctrl:
+        set_prop(ctrl, ACTIVE_LAYER_PROP, 1, 'Number of active cloud layers', 1, MAX_CLOUD_LAYERS)
+    set_active_layer_count(ctrl, ctrl.get(ACTIVE_LAYER_PROP, 1))
+
     defaults = {
         'cloud_scale': 18.0, 'cloud_complexity': 9.0, 'cloud_roughness': .56, 'cloud_contrast': .55,
         'cloud_opacity': 0.62,
         'hue_shift': .50, 'saturation': 1.18, 'brightness': 1.06,
-        'atmosphere_strength': 0.45,
-        'atmosphere_thickness': 0.38,
-        'atmosphere_falloff': 0.70,
-        'atmosphere_alpha': 0.85,
-        'swirl_tightness': 0.32,
-        'swirl_curvature': 0.25,
-        'swirl_scale': 6.0,
-        'swirl_offset': 0.0,
-        'swirl_layer_variation': 0.35,
+        'atmosphere_strength': 0.45, 'atmosphere_thickness': 0.38,
+        'atmosphere_falloff': 0.70, 'atmosphere_alpha': 0.85,
+        'swirl_tightness': 0.32, 'swirl_curvature': 0.25,
+        'swirl_scale': 6.0, 'swirl_offset': 0.0, 'swirl_layer_variation': 0.35,
     }
-    for i, value in enumerate([.22,.34,.48,.58,.68,.78], 1):
-        defaults[f'layer_{i}_strength'] = value
     for k, v in defaults.items():
         if k not in ctrl:
             set_prop(ctrl, k, v, k.replace('_',' ').title(), 0.0, 2.0 if k in {'saturation','brightness'} else 1.0)
-    # Per-layer controls are initialized from the legacy global controls so
-    # existing scenes keep the same starting look, but each layer can diverge.
-    base_scale = float(ctrl.get('cloud_scale', defaults['cloud_scale']))
-    base_complexity = float(ctrl.get('cloud_complexity', defaults['cloud_complexity']))
-    base_roughness = float(ctrl.get('cloud_roughness', defaults['cloud_roughness']))
-    base_contrast = float(ctrl.get('cloud_contrast', defaults['cloud_contrast']))
-    base_opacity = float(ctrl.get('cloud_opacity', defaults['cloud_opacity']))
-    base_tightness = float(ctrl.get('swirl_tightness', defaults['swirl_tightness']))
-    base_curvature = float(ctrl.get('swirl_curvature', defaults['swirl_curvature']))
-    base_swirl_scale = float(ctrl.get('swirl_scale', defaults['swirl_scale']))
-    base_offset = float(ctrl.get('swirl_offset', defaults['swirl_offset']))
-    for i, scale_mult in enumerate(LAYER_SCALE_MULTS, 1):
-        layer_defaults = {
-            f'layer_{i}_cloud_scale': max(0.1, base_scale * scale_mult),
-            f'layer_{i}_cloud_complexity': base_complexity,
-            f'layer_{i}_cloud_roughness': base_roughness,
-            f'layer_{i}_cloud_contrast': base_contrast,
-            f'layer_{i}_cloud_opacity': base_opacity,
-            f'layer_{i}_swirl_tightness': max(0.0, base_tightness * (0.70 + i * 0.12)),
-            f'layer_{i}_swirl_curvature': max(-1.0, min(1.0, base_curvature + (i - 3.5) * 0.07)),
-            f'layer_{i}_swirl_scale': max(0.1, base_swirl_scale * (0.80 + i * 0.08)),
-            f'layer_{i}_swirl_offset': base_offset + i * 0.11,
-        }
-        for k, v in layer_defaults.items():
-            if k not in ctrl:
-                set_prop(ctrl, k, v, k.replace('_',' ').title(), 0.0, 1.0)
+
+    for i in range(1, MAX_CLOUD_LAYERS + 1):
+        ensure_layer_properties(ctrl, i)
+
     if ctrl.get(TUNING_VERSION_PROP, 0) < 1:
-        for i in range(1, 7):
+        for i in range(1, MAX_CLOUD_LAYERS + 1):
             tightness_key = f'layer_{i}_swirl_tightness'
             opacity_key = f'layer_{i}_cloud_opacity'
             if tightness_key in ctrl:
-                ctrl[tightness_key] = min(2.0, float(ctrl[tightness_key]) * 1.75)
+                ctrl[tightness_key] = min(2.0, float(ctrl[tightness_key]) * 1.35)
             if opacity_key in ctrl:
                 ctrl[opacity_key] = max(0.58, float(ctrl[opacity_key]))
-        if 'saturation' in ctrl:
-            ctrl['saturation'] = max(1.18, float(ctrl['saturation']))
-        if 'brightness' in ctrl:
-            ctrl['brightness'] = max(1.06, float(ctrl['brightness']))
+        ctrl['saturation'] = max(1.18, float(ctrl.get('saturation', 1.18)))
+        ctrl['brightness'] = max(1.06, float(ctrl.get('brightness', 1.06)))
         ctrl[TUNING_VERSION_PROP] = 1
+
     if 'atmosphere_color' not in ctrl:
         set_prop(ctrl, 'atmosphere_color', [0.45, 0.82, 1.0, 1.0], 'Atmospheric rim / limb glow color', 0, 1, 'COLOR')
-    # Re-apply UI metadata for colors even if they already exist.
-    for i in range(1, 7):
-        try:
-            ctrl.id_properties_ui(f'band_color_{i}').update(subtype='COLOR', min=0, max=1, soft_min=0, soft_max=1)
-        except Exception:
-            pass
     try:
         ctrl.id_properties_ui('atmosphere_color').update(subtype='COLOR', min=0, max=1, soft_min=0, soft_max=1)
     except Exception:
         pass
-    # Cloud structure ranges.
+
     for prop_name, min_value, max_value, soft_max in [
         ('cloud_scale', 0.1, 250.0, 80.0),
         ('cloud_complexity', 0.0, 15.0, 15.0),
@@ -204,54 +311,25 @@ def setup_controller(ctrl):
             ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=soft_max)
         except Exception:
             pass
-    for i in range(1, 7):
-        for prop_name, min_value, max_value, soft_max in [
-            (f'layer_{i}_cloud_scale', 0.1, 250.0, 80.0),
-            (f'layer_{i}_cloud_complexity', 0.0, 15.0, 15.0),
-            (f'layer_{i}_cloud_roughness', 0.0, 1.0, 1.0),
-            (f'layer_{i}_cloud_contrast', 0.0, 1.0, 1.0),
-            (f'layer_{i}_cloud_opacity', 0.0, 1.0, 1.0),
-            (f'layer_{i}_strength', 0.0, 1.0, 1.0),
-        ]:
-            try:
-                ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=soft_max)
-            except Exception:
-                pass
-    # Atmosphere control ranges.
+
     for prop_name, max_value in [
-        ('atmosphere_strength', 5.0),
-        ('atmosphere_thickness', 1.0),
-        ('atmosphere_falloff', 1.0),
-        ('atmosphere_alpha', 1.0),
+        ('atmosphere_strength', 5.0), ('atmosphere_thickness', 1.0),
+        ('atmosphere_falloff', 1.0), ('atmosphere_alpha', 1.0),
     ]:
         try:
             ctrl.id_properties_ui(prop_name).update(min=0.0, max=max_value, soft_min=0.0, soft_max=max_value)
         except Exception:
             pass
 
-    # Swirl / coordinate warp ranges.
     for prop_name, min_value, max_value in [
-        ('swirl_tightness', 0.0, 2.0),
-        ('swirl_curvature', -1.0, 1.0),
-        ('swirl_scale', 0.1, 50.0),
-        ('swirl_offset', -10.0, 10.0),
+        ('swirl_tightness', 0.0, 2.0), ('swirl_curvature', -1.0, 1.0),
+        ('swirl_scale', 0.1, 50.0), ('swirl_offset', -10.0, 10.0),
         ('swirl_layer_variation', 0.0, 2.0),
     ]:
         try:
             ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=max_value)
         except Exception:
             pass
-    for i in range(1, 7):
-        for prop_name, min_value, max_value in [
-            (f'layer_{i}_swirl_tightness', 0.0, 2.0),
-            (f'layer_{i}_swirl_curvature', -1.0, 1.0),
-            (f'layer_{i}_swirl_scale', 0.1, 50.0),
-            (f'layer_{i}_swirl_offset', -10.0, 10.0),
-        ]:
-            try:
-                ctrl.id_properties_ui(prop_name).update(min=min_value, max=max_value, soft_min=min_value, soft_max=max_value)
-            except Exception:
-                pass
 
 
 def material_score(mat):
@@ -406,6 +484,7 @@ def make_rgb_node(nt, name, loc, ctrl, color_prop):
 def build_rig(context):
     ctrl = find_controller()
     setup_controller(ctrl)
+    active_count = get_active_layer_count(ctrl)
     mat = find_material(context)
     if not mat:
         raise RuntimeError('No likely node material found. Select the planet object first.')
@@ -437,10 +516,11 @@ def build_rig(context):
         frame.label = FRAME_NAME
     frame.location = (-1500, 400)
 
-    base_rgb = make_rgb_node(nt, 'GG Fallback Base Color', (-1500, 100), ctrl, 'band_color_6')
+    base_rgb = make_rgb_node(nt, 'GG Fallback Base Color', (-1500, 100), ctrl, 'band_color_1')
     previous = original_from if original_from else base_rgb.outputs[0]
 
-    for i in range(1, 7):
+    for i in range(1, active_count + 1):
+        ensure_layer_properties(ctrl, i)
         y = 600 - i * 220
         noise = get_or_new(nt, 'ShaderNodeTexNoise', f'GG Noise {i}', (-1400, y))
         ramp = get_or_new(nt, 'ShaderNodeValToRGB', f'GG Mask Ramp {i}', (-1160, y))
@@ -468,18 +548,14 @@ def build_rig(context):
             ramp.color_ramp.elements.remove(ramp.color_ramp.elements[-1])
         ramp.color_ramp.elements[0].color = (0,0,0,1)
         ramp.color_ramp.elements[1].color = (1,1,1,1)
-        # Simple expressions supported by Blender drivers.
         drive_prop(nt, f'nodes["{ramp.name}"].color_ramp.elements[0].position', ctrl, f'layer_{i}_cloud_contrast', '0.10+var*0.35')
         drive_prop(nt, f'nodes["{ramp.name}"].color_ramp.elements[1].position', ctrl, f'layer_{i}_cloud_contrast', '0.90-var*0.35')
         drive_prop(nt, f'nodes["{math.name}"].inputs[1].default_value', ctrl, f'layer_{i}_strength', 'var')
         drive_prop(nt, f'nodes["{opacity_math.name}"].inputs[1].default_value', ctrl, f'layer_{i}_cloud_opacity', 'var')
 
-        clear_input(nt, ramp.inputs[0])
-        link(nt, noise.outputs[0], ramp.inputs[0])
-        clear_input(nt, math.inputs[0])
-        link(nt, ramp.outputs[0], math.inputs[0])
-        clear_input(nt, opacity_math.inputs[0])
-        link(nt, math.outputs[0], opacity_math.inputs[0])
+        clear_input(nt, ramp.inputs[0]); link(nt, noise.outputs[0], ramp.inputs[0])
+        clear_input(nt, math.inputs[0]); link(nt, ramp.outputs[0], math.inputs[0])
+        clear_input(nt, opacity_math.inputs[0]); link(nt, math.outputs[0], opacity_math.inputs[0])
 
         fac, a, b, out = mix_sockets(mix)
         clear_input(nt, fac); clear_input(nt, a); clear_input(nt, b)
@@ -487,6 +563,8 @@ def build_rig(context):
         link(nt, previous, a)
         link(nt, color.outputs[0], b)
         previous = out
+
+    remove_layers_above(nt, active_count)
 
     hue = get_or_new(nt, 'ShaderNodeHueSaturation', 'GG Hue Saturation Value', (650, 100))
     hue.parent = frame
@@ -505,33 +583,70 @@ def build_rig(context):
     link(nt, color_output, base_input)
 
     mat['gas_giant_controller'] = ctrl.name
-    mat['gas_giant_v11_note'] = 'Built by Gas Giant Shader Controls v11. Six cloud layers are driven by independent per-layer structure properties.'
+    mat['gas_giant_active_cloud_layers'] = active_count
+    mat['gas_giant_v13_note'] = f'Built by Gas Giant Shader Controls v13. Active expandable cloud layers: {active_count}.'
     return mat.name
+
+
+def push_global_defaults_to_layers(ctrl):
+    """Copy global controls into each active layer as independent starting values."""
+    setup_controller(ctrl)
+    active_count = get_active_layer_count(ctrl)
+    base_scale = float(ctrl.get('cloud_scale', 18.0))
+    base_complexity = float(ctrl.get('cloud_complexity', 9.0))
+    base_roughness = float(ctrl.get('cloud_roughness', 0.56))
+    base_contrast = float(ctrl.get('cloud_contrast', 0.55))
+    base_opacity = float(ctrl.get('cloud_opacity', 0.62))
+    base_tightness = float(ctrl.get('swirl_tightness', 0.32))
+    base_curvature = float(ctrl.get('swirl_curvature', 0.25))
+    base_swirl_scale = float(ctrl.get('swirl_scale', 6.0))
+    base_offset = float(ctrl.get('swirl_offset', 0.0))
+    variation = float(ctrl.get('swirl_layer_variation', 0.35))
+
+    for i in range(1, active_count + 1):
+        layer_center = i - ((active_count + 1) / 2.0)
+        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, base_scale * scale_mult_for_layer(i))
+        ctrl[f'layer_{i}_cloud_complexity'] = base_complexity
+        ctrl[f'layer_{i}_cloud_roughness'] = base_roughness
+        ctrl[f'layer_{i}_cloud_contrast'] = base_contrast
+        ctrl[f'layer_{i}_cloud_opacity'] = base_opacity
+        ctrl[f'layer_{i}_swirl_tightness'] = max(0.0, min(2.0, base_tightness * (0.75 + i * 0.12 + variation * 0.12)))
+        ctrl[f'layer_{i}_swirl_curvature'] = max(-1.0, min(1.0, base_curvature + layer_center * 0.10 * max(0.2, variation)))
+        ctrl[f'layer_{i}_swirl_scale'] = max(0.1, base_swirl_scale * (0.75 + i * 0.10))
+        ctrl[f'layer_{i}_swirl_offset'] = base_offset + i * (0.13 + variation * 0.05)
 
 
 def apply_preset(ctrl, key):
     setup_controller(ctrl)
+    active_count = get_active_layer_count(ctrl)
     p = PRESETS[key]
     _, _, colors, scale, detail, rough, contrast, layers, hue, sat, bright = p
-    for i, c in enumerate(colors, 1):
+    for i in range(1, active_count + 1):
+        c = colors[(i - 1) % len(colors)]
         ctrl[f'band_color_{i}'] = list(c)
     ctrl['cloud_scale'] = scale
     ctrl['cloud_complexity'] = detail
     ctrl['cloud_roughness'] = rough
     ctrl['cloud_contrast'] = contrast
     ctrl['cloud_opacity'] = 0.62
-    for i, val in enumerate(layers, 1):
-        ctrl[f'layer_{i}_strength'] = val
-        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, scale * LAYER_SCALE_MULTS[i-1])
-        ctrl[f'layer_{i}_cloud_complexity'] = detail
-        ctrl[f'layer_{i}_cloud_roughness'] = rough
-        ctrl[f'layer_{i}_cloud_contrast'] = contrast
-        ctrl[f'layer_{i}_cloud_opacity'] = 0.62
     ctrl['hue_shift'] = hue
     ctrl['saturation'] = max(1.18, sat)
     ctrl['brightness'] = max(1.06, bright)
 
-
+    for i in range(1, active_count + 1):
+        val = layers[(i - 1) % len(layers)]
+        layer_center = i - ((active_count + 1) / 2.0)
+        alternating = -1.0 if i % 2 else 1.0
+        ctrl[f'layer_{i}_strength'] = max(0.0, min(1.0, val))
+        ctrl[f'layer_{i}_cloud_scale'] = max(0.1, scale * scale_mult_for_layer(i))
+        ctrl[f'layer_{i}_cloud_complexity'] = max(0.0, min(15.0, detail * (0.92 + i * 0.025)))
+        ctrl[f'layer_{i}_cloud_roughness'] = max(0.0, min(1.0, rough + layer_center * 0.018))
+        ctrl[f'layer_{i}_cloud_contrast'] = max(0.0, min(1.0, contrast + layer_center * 0.025))
+        ctrl[f'layer_{i}_cloud_opacity'] = 0.58 + min(0.22, val * 0.18)
+        ctrl[f'layer_{i}_swirl_tightness'] = max(0.0, min(2.0, (rough + contrast) * (0.45 + i * 0.085)))
+        ctrl[f'layer_{i}_swirl_curvature'] = max(-1.0, min(1.0, alternating * (0.12 + contrast * 0.42 + i * 0.035)))
+        ctrl[f'layer_{i}_swirl_scale'] = max(0.1, scale * (0.28 + i * 0.115))
+        ctrl[f'layer_{i}_swirl_offset'] = i * 0.17 + contrast * 0.35
 
 
 def find_material_output(nt):
@@ -663,7 +778,7 @@ def build_atmosphere(context):
     clear_input(nt, surface_input)
     link(nt, shader_output_socket(add), surface_input)
 
-    mat['gas_giant_atmosphere_note'] = 'Visible atmospheric edge/rim glow added by Gas Giant Shader Controls v11.'
+    mat['gas_giant_atmosphere_note'] = 'Visible atmospheric edge/rim glow added by Gas Giant Shader Controls v13.'
     return mat.name
 
 
@@ -708,7 +823,7 @@ def remove_legacy_shared_swirl_nodes(nt):
 
 
 def build_swirl_warp(context):
-    """Add/repair per-layer coordinate-warp node rigs for the six GG Noise nodes.
+    """Add/repair per-layer coordinate-warp node rigs for the active GG Noise nodes.
 
     This does not create true fluid simulation vortices. It creates procedural coordinate
     distortion before each cloud noise layer, which is the shader-node equivalent of
@@ -728,7 +843,7 @@ def build_swirl_warp(context):
     nt = mat.node_tree
     nodes = nt.nodes
 
-    # If the six-layer cloud rig does not exist yet, build it first so there are targets.
+    # If the active cloud rig does not exist yet, build it first so there are targets.
     if not nodes.get('GG Noise 1'):
         build_rig(context)
         nt = mat.node_tree
@@ -749,7 +864,8 @@ def build_swirl_warp(context):
     # Each cloud layer gets the same coordinate-warp recipe, but with its own
     # mapping/noise/tightness/add nodes and its own controller properties.
     wired = 0
-    for i in range(1, 7):
+    active_count = get_active_layer_count(ctrl)
+    for i in range(1, active_count + 1):
         noise = nodes.get(f'GG Noise {i}')
         if not noise or 'Vector' not in noise.inputs:
             continue
@@ -813,12 +929,13 @@ def build_swirl_warp(context):
         clear_input(nt, noise.inputs['Vector']); link(nt, add.outputs[0], noise.inputs['Vector'])
         wired += 1
 
-    mat['gas_giant_swirl_note'] = f'Independent per-layer swirl warp node rig added by Gas Giant Shader Controls v11; wired {wired} cloud noise nodes.'
+    mat['gas_giant_swirl_note'] = f'Independent per-layer swirl warp node rig added by Gas Giant Shader Controls v13; wired {wired} active cloud noise nodes.'
     return mat.name, wired
 
 
 def apply_test_swirl(ctrl):
     setup_controller(ctrl)
+    active_count = get_active_layer_count(ctrl)
     layer_values = [
         (0.45, -0.35, 5.5, 0.00),
         (0.70, 0.55, 7.0, 0.35),
@@ -827,11 +944,36 @@ def apply_test_swirl(ctrl):
         (1.30, -0.55, 13.5, 1.40),
         (0.60, 0.35, 16.0, 1.75),
     ]
-    for i, (tightness, curvature, scale, offset) in enumerate(layer_values, 1):
+    for i in range(1, active_count + 1):
+        tightness, curvature, scale, offset = layer_values[(i - 1) % len(layer_values)]
         ctrl[f'layer_{i}_swirl_tightness'] = tightness
         ctrl[f'layer_{i}_swirl_curvature'] = curvature
-        ctrl[f'layer_{i}_swirl_scale'] = scale
-        ctrl[f'layer_{i}_swirl_offset'] = offset
+        ctrl[f'layer_{i}_swirl_scale'] = scale + max(0, i - 6) * 1.5
+        ctrl[f'layer_{i}_swirl_offset'] = offset + max(0, i - 6) * 0.22
+
+
+def add_one_cloud_layer(context):
+    ctrl = find_controller()
+    setup_controller(ctrl)
+    old_count = get_active_layer_count(ctrl)
+    new_count = set_active_layer_count(ctrl, old_count + 1)
+    ensure_layer_properties(ctrl, new_count)
+    mat_name = build_rig(context)
+    _, wired = build_swirl_warp(context)
+    return mat_name, new_count, wired
+
+
+def remove_last_cloud_layer(context):
+    ctrl = find_controller()
+    setup_controller(ctrl)
+    old_count = get_active_layer_count(ctrl)
+    new_count = set_active_layer_count(ctrl, old_count - 1)
+    mat = find_material(context)
+    if mat and mat.node_tree:
+        remove_layers_above(mat.node_tree, new_count)
+    mat_name = build_rig(context)
+    _, wired = build_swirl_warp(context)
+    return mat_name, new_count, wired
 
 
 class GASGIANT_OT_diagnostics(bpy.types.Operator):
@@ -849,16 +991,101 @@ class GASGIANT_OT_diagnostics(bpy.types.Operator):
 
 class GASGIANT_OT_build(bpy.types.Operator):
     bl_idname = 'gasgiant.build_v3'
-    bl_label = 'Build / Repair 6-Layer Rig'
+    bl_label = 'Build / Repair Active Layer Stack'
+    bl_description = 'Build the active cloud-layer stack and wire independent per-layer swirl/curvature controls'
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         try:
             mat_name = build_rig(context)
+            _, wired = build_swirl_warp(context)
         except Exception as e:
             self.report({'ERROR'}, str(e))
-            print('Gas Giant v3 error:', repr(e))
+            print('Gas Giant v13 build error:', repr(e))
             return {'CANCELLED'}
-        self.report({'INFO'}, f'Built 6-layer rig on material: {mat_name}')
+        self.report({'INFO'}, f'Built active layer stack on {mat_name}; active layers: {get_active_layer_count(find_controller())}; wired {wired} swirl layers.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_add_layer(bpy.types.Operator):
+    bl_idname = 'gasgiant.add_cloud_layer_v13'
+    bl_label = 'Add Cloud Layer'
+    bl_description = 'Add one more procedural cloud layer and rebuild the active layer stack'
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        try:
+            mat_name, count, wired = add_one_cloud_layer(context)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            print('Gas Giant v13 add layer error:', repr(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Added cloud layer {count} on {mat_name}; wired {wired} swirl layers.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_remove_layer(bpy.types.Operator):
+    bl_idname = 'gasgiant.remove_cloud_layer_v13'
+    bl_label = 'Remove Last Cloud Layer'
+    bl_description = 'Remove the highest active cloud layer and rebuild the active layer stack'
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        ctrl = find_controller()
+        if get_active_layer_count(ctrl) <= 1:
+            self.report({'WARNING'}, 'The stack already has the minimum of one cloud layer.')
+            return {'CANCELLED'}
+        try:
+            mat_name, count, wired = remove_last_cloud_layer(context)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            print('Gas Giant v13 remove layer error:', repr(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Removed last cloud layer. Active layers: {count}; wired {wired} swirl layers on {mat_name}.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_push_globals(bpy.types.Operator):
+    bl_idname = 'gasgiant.push_globals_to_layers_v13'
+    bl_label = 'Push Global Defaults To Layers'
+    bl_description = 'Copy global cloud/swirl values into each layer as independent starting values'
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        ctrl = find_controller()
+        push_global_defaults_to_layers(ctrl)
+        self.report({'INFO'}, 'Copied global values into independent per-layer controls.')
+        return {'FINISHED'}
+
+
+class GASGIANT_OT_validate_wiring(bpy.types.Operator):
+    bl_idname = 'gasgiant.validate_per_layer_wiring_v13'
+    bl_label = 'Validate Per-Layer Wiring'
+    bl_description = 'Check that each GG Noise node receives its vector input from its matching per-layer warp chain'
+    bl_options = {'REGISTER'}
+    def execute(self, context):
+        mat = find_material(context)
+        if not mat:
+            self.report({'ERROR'}, 'No likely node material found. Select the planet object first.')
+            return {'CANCELLED'}
+        ctrl = find_controller()
+        active_count = get_active_layer_count(ctrl)
+        nt = mat.node_tree
+        problems = []
+        for i in range(1, active_count + 1):
+            noise = nt.nodes.get(f'GG Noise {i}')
+            expected = f'GG Swirl Layer Add Warp {i}'
+            if not noise:
+                problems.append(f'GG Noise {i} missing')
+                continue
+            if 'Vector' not in noise.inputs or not noise.inputs['Vector'].is_linked:
+                problems.append(f'GG Noise {i} Vector not linked')
+                continue
+            source_node = noise.inputs['Vector'].links[0].from_node
+            if source_node.name != expected:
+                problems.append(f'GG Noise {i} Vector linked from {source_node.name}, expected {expected}')
+        if problems:
+            for problem in problems:
+                print('Gas Giant v13 wiring problem:', problem)
+            self.report({'WARNING'}, f'Per-layer wiring has {len(problems)} issue(s). See console.')
+        else:
+            self.report({'INFO'}, f'All {active_count} active cloud layer(s) are wired to matching independent swirl chains.')
         return {'FINISHED'}
 
 
@@ -901,7 +1128,7 @@ class GASGIANT_OT_build_swirl(bpy.types.Operator):
             mat_name, wired = build_swirl_warp(context)
         except Exception as e:
             self.report({'ERROR'}, str(e))
-            print('Gas Giant v11 swirl error:', repr(e))
+            print('Gas Giant v13 swirl error:', repr(e))
             return {'CANCELLED'}
         self.report({'INFO'}, f'Built per-layer swirl warp on {mat_name}; wired {wired} cloud noise nodes.')
         return {'FINISHED'}
@@ -944,8 +1171,8 @@ class GASGIANT_OT_select_ctrl(bpy.types.Operator):
 
 
 class GASGIANT_PT_panel(bpy.types.Panel):
-    bl_label = 'Shader Controls v11'
-    bl_idname = 'GASGIANT_PT_shader_controls_v6'
+    bl_label = 'Shader Controls v13'
+    bl_idname = 'GASGIANT_PT_shader_controls_v13'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Gas Giant'
@@ -956,44 +1183,57 @@ class GASGIANT_PT_panel(bpy.types.Panel):
         row.operator('gasgiant.diagnostics_v3', icon='INFO')
         row.operator('gasgiant.select_ctrl_v3', icon='EMPTY_AXIS')
         layout.operator('gasgiant.build_v3', icon='NODETREE')
-        layout.operator('gasgiant.build_atmosphere_v5', icon='WORLD')
-        layout.operator('gasgiant.test_atmosphere_v5', icon='LIGHT_HEMI')
-        layout.operator('gasgiant.build_swirl_v6', icon='MOD_WARP')
-        layout.operator('gasgiant.test_swirl_v6', icon='FORCE_VORTEX')
-        box = layout.box()
-        box.label(text='Presets')
-        box.prop(context.scene, 'gas_giant_preset_v3', text='')
-        box.operator('gasgiant.apply_preset_v3', icon='PRESET')
+
         if not ctrl:
             layout.label(text='Controller appears after build or preset.', icon='INFO')
             return
         setup_controller(ctrl)
-        box = layout.box(); box.label(text='Palette')
-        for i in range(1,7):
-            box.prop(ctrl, f'["band_color_{i}"]', text=f'Color {i}')
-        box = layout.box(); box.label(text='Per-Layer Cloud Structure')
-        for i in range(1,7):
+        active_count = get_active_layer_count(ctrl)
+
+        box = layout.box()
+        box.label(text='Layer Stack')
+        box.prop(ctrl, f'["{ACTIVE_LAYER_PROP}"]', text='Active Cloud Layers')
+        row = box.row(align=True)
+        row.operator('gasgiant.add_cloud_layer_v13', icon='ADD')
+        row.operator('gasgiant.remove_cloud_layer_v13', icon='REMOVE')
+        box.operator('gasgiant.validate_per_layer_wiring_v13', icon='CHECKMARK')
+        box.label(text=f'Editing {active_count} active layer(s); max {MAX_CLOUD_LAYERS}.')
+
+        layout.operator('gasgiant.build_atmosphere_v5', icon='WORLD')
+        layout.operator('gasgiant.test_atmosphere_v5', icon='LIGHT_HEMI')
+        layout.operator('gasgiant.build_swirl_v6', icon='MOD_WARP')
+        layout.operator('gasgiant.test_swirl_v6', icon='FORCE_VORTEX')
+
+        box = layout.box()
+        box.label(text='Presets')
+        box.prop(context.scene, 'gas_giant_preset_v3', text='')
+        box.operator('gasgiant.apply_preset_v3', icon='PRESET')
+
+        box = layout.box(); box.label(text='Global Defaults / Utilities')
+        box.operator('gasgiant.push_globals_to_layers_v13', icon='FILE_REFRESH')
+        for name in ['cloud_scale','cloud_complexity','cloud_roughness','cloud_contrast','cloud_opacity','swirl_tightness','swirl_curvature','swirl_scale','swirl_offset','swirl_layer_variation']:
+            box.prop(ctrl, f'["{name}"]', text=name.replace('_',' ').title())
+
+        box = layout.box(); box.label(text='Active Layer Controls')
+        for i in range(1, active_count + 1):
             col = box.column(align=True)
             col.label(text=f'Layer {i}')
-            col.prop(ctrl, f'["layer_{i}_cloud_scale"]', text='Scale')
+            col.prop(ctrl, f'["band_color_{i}"]', text='Color')
+            col.prop(ctrl, f'["layer_{i}_strength"]', text='Strength')
+            col.prop(ctrl, f'["layer_{i}_cloud_scale"]', text='Cloud Scale')
             col.prop(ctrl, f'["layer_{i}_cloud_complexity"]', text='Complexity')
             col.prop(ctrl, f'["layer_{i}_cloud_roughness"]', text='Roughness')
             col.prop(ctrl, f'["layer_{i}_cloud_contrast"]', text='Contrast')
             col.prop(ctrl, f'["layer_{i}_cloud_opacity"]', text='Opacity')
-        box = layout.box(); box.label(text='Per-Layer Swirl / Curvature')
-        for i in range(1,7):
-            col = box.column(align=True)
-            col.label(text=f'Layer {i}')
-            col.prop(ctrl, f'["layer_{i}_swirl_tightness"]', text='Tightness')
-            col.prop(ctrl, f'["layer_{i}_swirl_curvature"]', text='Curvature')
-            col.prop(ctrl, f'["layer_{i}_swirl_scale"]', text='Scale')
-            col.prop(ctrl, f'["layer_{i}_swirl_offset"]', text='Offset')
-        box = layout.box(); box.label(text='Cloud Layers')
-        for i in range(1,7):
-            box.prop(ctrl, f'["layer_{i}_strength"]', text=f'Layer {i}')
+            col.prop(ctrl, f'["layer_{i}_swirl_tightness"]', text='Swirl Tightness')
+            col.prop(ctrl, f'["layer_{i}_swirl_curvature"]', text='Swirl Curvature')
+            col.prop(ctrl, f'["layer_{i}_swirl_scale"]', text='Swirl Scale')
+            col.prop(ctrl, f'["layer_{i}_swirl_offset"]', text='Swirl Offset')
+
         box = layout.box(); box.label(text='Global Color')
         for name in ['hue_shift','saturation','brightness']:
             box.prop(ctrl, f'["{name}"]', text=name.replace('_',' ').title())
+
         box = layout.box(); box.label(text='Planet Edge Atmosphere')
         box.prop(ctrl, '["atmosphere_color"]', text='Atmosphere Color')
         for name in ['atmosphere_strength','atmosphere_thickness','atmosphere_falloff','atmosphere_alpha']:
@@ -1003,6 +1243,10 @@ class GASGIANT_PT_panel(bpy.types.Panel):
 CLASSES = [
     GASGIANT_OT_diagnostics,
     GASGIANT_OT_build,
+    GASGIANT_OT_add_layer,
+    GASGIANT_OT_remove_layer,
+    GASGIANT_OT_push_globals,
+    GASGIANT_OT_validate_wiring,
     GASGIANT_OT_build_atmosphere,
     GASGIANT_OT_test_atmosphere,
     GASGIANT_OT_build_swirl,
@@ -1041,4 +1285,4 @@ def unregister():
 
 if __name__ == '__main__':
     register()
-    print('Gas Giant Shader Controls v11 registered. Press N > Gas Giant > Diagnostics, then Build / Repair 6-Layer Rig, Build / Repair Atmosphere Edge, or Build / Repair Per-Layer Swirl Warp.')
+    print('Gas Giant Shader Controls v13 registered. Press N > Gas Giant > Diagnostics, then Build / Repair Active Layer Stack, then optionally Build / Repair Atmosphere Edge or Validate Per-Layer Wiring.')
