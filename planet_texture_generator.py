@@ -21,6 +21,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import colorsys
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -188,6 +189,66 @@ COLORS = {
     "snow": np.array([235, 242, 238], dtype=np.float32),
     "ice": np.array([194, 228, 240], dtype=np.float32),
 }
+
+
+def vary_palette(seed, preset):
+    rng = np.random.default_rng(seed * 1009 + sum(ord(c) for c in preset))
+    global_hue = rng.uniform(-0.035, 0.035)
+    global_sat = rng.uniform(0.88, 1.18)
+    global_val = rng.uniform(0.90, 1.10)
+    category_hue = {
+        "deep_ocean": rng.uniform(-0.045, 0.045),
+        "ocean_mid": rng.uniform(-0.045, 0.045),
+        "shallow_ocean": rng.uniform(-0.055, 0.055),
+        "beach": rng.uniform(-0.035, 0.035),
+        "dark_forest": rng.uniform(-0.030, 0.030),
+        "forest": rng.uniform(-0.030, 0.030),
+        "grass": rng.uniform(-0.040, 0.040),
+        "dry_plain": rng.uniform(-0.045, 0.045),
+        "desert": rng.uniform(-0.050, 0.050),
+        "rock": rng.uniform(-0.025, 0.025),
+        "snow": rng.uniform(-0.012, 0.012),
+        "ice": rng.uniform(-0.025, 0.025),
+    }
+    category_sat = {
+        "deep_ocean": rng.uniform(0.90, 1.22),
+        "ocean_mid": rng.uniform(0.90, 1.22),
+        "shallow_ocean": rng.uniform(0.88, 1.25),
+        "beach": rng.uniform(0.82, 1.18),
+        "dark_forest": rng.uniform(0.82, 1.20),
+        "forest": rng.uniform(0.82, 1.20),
+        "grass": rng.uniform(0.82, 1.18),
+        "dry_plain": rng.uniform(0.78, 1.18),
+        "desert": rng.uniform(0.82, 1.24),
+        "rock": rng.uniform(0.72, 1.12),
+        "snow": rng.uniform(0.82, 1.04),
+        "ice": rng.uniform(0.86, 1.12),
+    }
+    category_val = {
+        "deep_ocean": rng.uniform(0.82, 1.12),
+        "ocean_mid": rng.uniform(0.86, 1.14),
+        "shallow_ocean": rng.uniform(0.88, 1.18),
+        "beach": rng.uniform(0.86, 1.15),
+        "dark_forest": rng.uniform(0.78, 1.12),
+        "forest": rng.uniform(0.82, 1.14),
+        "grass": rng.uniform(0.82, 1.15),
+        "dry_plain": rng.uniform(0.84, 1.16),
+        "desert": rng.uniform(0.86, 1.18),
+        "rock": rng.uniform(0.78, 1.16),
+        "snow": rng.uniform(0.92, 1.08),
+        "ice": rng.uniform(0.90, 1.12),
+    }
+
+    palette = {}
+    for name, rgb in COLORS.items():
+        r, g, b = (rgb / 255.0).tolist()
+        h, s, v = colorsys.rgb_to_hsv(r, g, b)
+        h = (h + global_hue + category_hue[name]) % 1.0
+        s = np.clip(s * global_sat * category_sat[name], 0.0, 1.0)
+        v = np.clip(v * global_val * category_val[name], 0.0, 1.0)
+        varied = colorsys.hsv_to_rgb(h, s, v)
+        palette[name] = np.array(varied, dtype=np.float32) * 255.0
+    return palette
 
 
 @dataclass
@@ -369,6 +430,7 @@ def render_globe_preview(color, height_map, out_path, size=900):
 def build_maps(cfg):
     x, y, z, lat, lon = sphere_vectors(cfg.width, cfg.height)
     lat_abs = np.abs(np.sin(lat))
+    colors = vary_palette(cfg.seed, cfg.preset)
 
     continent = fbm_3d(
         x,
@@ -401,8 +463,9 @@ def build_maps(cfg):
         + cfg.seed * 0.017
     )
     island_field = lerp(island_noise, island_noise * 0.72 + chain * 0.28, cfg.island_chain_strength)
+    island_gate = fbm_3d(x, y, z, max(2.0, cfg.island_scale * 0.18), 3, 0.54, cfg.seed + 1881)
     island_cutoff = np.clip(cfg.island_threshold - cfg.island_density * 0.22, 0.20, 0.96)
-    island_land = (island_field > island_cutoff) & (~continent_land)
+    island_land = (island_field > island_cutoff) & (island_gate > 0.42) & (~continent_land)
     land = continent_land | island_land
 
     shoreline_distance = np.abs(land_field - threshold)
@@ -423,30 +486,32 @@ def build_maps(cfg):
 
     ridge = 1.0 - np.abs(fbm_3d(x, y, z, cfg.mountain_scale, 6, 0.67, cfg.seed + 4111) * 2.0 - 1.0)
     ridge = np.power(np.clip(ridge, 0.0, 1.0), 1.0 + cfg.mountain_sharpness * 3.0)
+    mountain_gate = fbm_3d(x, y, z, max(1.0, cfg.mountain_scale * 0.32), 4, 0.56, cfg.seed + 4229)
     mountain_cut = np.clip(1.0 - cfg.mountain_density, 0.05, 0.95)
     mountain_mask = smoothstep(mountain_cut, min(1.0, mountain_cut + 0.28), ridge)
+    mountain_mask *= smoothstep(0.45, 0.76, mountain_gate)
 
     color = np.zeros((cfg.height, cfg.width, 3), dtype=np.float32)
     ocean_variation = fbm_3d(x, y, z, 18.0, 4, 0.5, cfg.seed + 5111)
-    ocean_color = color_blend(COLORS["deep_ocean"], COLORS["ocean_mid"], ocean_variation * cfg.ocean_current_strength)
-    ocean_color = color_blend(ocean_color, COLORS["shallow_ocean"], shelf)
+    ocean_color = color_blend(colors["deep_ocean"], colors["ocean_mid"], ocean_variation * cfg.ocean_current_strength)
+    ocean_color = color_blend(ocean_color, colors["shallow_ocean"], shelf)
     color[:] = ocean_color
 
-    land_color = color_blend(COLORS["grass"], COLORS["dry_plain"], np.clip(biome + desert_bias - 0.45, 0.0, 1.0))
-    land_color = color_blend(land_color, COLORS["desert"], np.clip(desert_bias + biome * 0.35 - 0.28, 0.0, 1.0))
+    land_color = color_blend(colors["grass"], colors["dry_plain"], np.clip(biome + desert_bias - 0.45, 0.0, 1.0))
+    land_color = color_blend(land_color, colors["desert"], np.clip(desert_bias + biome * 0.35 - 0.28, 0.0, 1.0))
     forest_mix = np.clip(forest_bias + moisture * 0.35 - biome * 0.35, 0.0, 1.0)
-    land_color = color_blend(land_color, COLORS["forest"], forest_mix)
-    land_color = color_blend(land_color, COLORS["dark_forest"], np.clip(forest_mix * moisture - 0.15, 0.0, 0.65))
-    land_color = color_blend(land_color, COLORS["rock"], mountain_mask * 0.74)
-    land_color = color_blend(land_color, COLORS["beach"], shoreline * 0.78)
+    land_color = color_blend(land_color, colors["forest"], forest_mix)
+    land_color = color_blend(land_color, colors["dark_forest"], np.clip(forest_mix * moisture - 0.15, 0.0, 0.65))
+    land_color = color_blend(land_color, colors["rock"], mountain_mask * 0.74)
+    land_color = color_blend(land_color, colors["beach"], shoreline * 0.78)
 
     snow_mask = smoothstep(cfg.snow_threshold, 1.0, mountain_mask * 0.72 + lat_abs * 0.38)
     ice_start = max(0.02, 1.0 - cfg.polar_ice_size)
     polar_ice = smoothstep(ice_start, min(1.0, ice_start + 0.12), lat_abs)
     ice_mask = np.maximum(snow_mask, polar_ice)
-    land_color = color_blend(land_color, COLORS["snow"], snow_mask)
-    land_color = color_blend(land_color, COLORS["ice"], polar_ice)
-    ocean_color_with_ice = color_blend(color, COLORS["ice"], np.where(~land, polar_ice * 0.72, 0.0))
+    land_color = color_blend(land_color, colors["snow"], snow_mask)
+    land_color = color_blend(land_color, colors["ice"], polar_ice)
+    ocean_color_with_ice = color_blend(color, colors["ice"], np.where(~land, polar_ice * 0.72, 0.0))
     color = np.where(land[..., None], land_color, ocean_color_with_ice)
 
     base_land_height = smoothstep(threshold - cfg.continent_contrast, threshold + cfg.continent_contrast, land_field)
@@ -615,7 +680,12 @@ def main():
     render_globe_preview(maps["color"], maps["height"], out_dir / "preview.png")
     write_html_preview(out_dir, f"{cfg.preset} planet preview")
 
-    (out_dir / "preset.json").write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+    metadata = asdict(cfg)
+    metadata["resolved_palette_rgb"] = {
+        name: [int(round(channel)) for channel in color]
+        for name, color in vary_palette(cfg.seed, cfg.preset).items()
+    }
+    (out_dir / "preset.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote planet maps to {out_dir.resolve()}")
 
 
