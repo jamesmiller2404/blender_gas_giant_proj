@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>earthlike planet preview</title>
+<style>
+body { margin: 0; background: #101116; color: #e8e8e8; font: 14px system-ui, sans-serif; }
+main { display: grid; grid-template-columns: minmax(320px, 520px) 1fr; gap: 24px; padding: 24px; align-items: start; }
+canvas { width: 100%; max-width: 520px; aspect-ratio: 1; background: #05070b; }
+img { max-width: 100%; height: auto; background: #05070b; }
+.maps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+figure { margin: 0; }
+figcaption { margin: 6px 0 14px; color: #b9bcc6; }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <canvas id="globe" width="720" height="720"></canvas>
+    <figcaption>Interactive rotating globe preview from color.png</figcaption>
+  </section>
+  <section class="maps">
+    <figure><img src="preview.png"><figcaption>preview.png</figcaption></figure>
+    <figure><img src="color.png"><figcaption>color.png</figcaption></figure>
+    <figure><img src="height.png"><figcaption>height.png</figcaption></figure>
+    <figure><img src="normal.png"><figcaption>normal.png</figcaption></figure>
+    <figure><img src="roughness.png"><figcaption>roughness.png</figcaption></figure>
+    <figure><img src="land_mask.png"><figcaption>land_mask.png</figcaption></figure>
+    <figure><img src="shoreline_mask.png"><figcaption>shoreline_mask.png</figcaption></figure>
+    <figure><img src="ocean_depth.png"><figcaption>ocean_depth.png</figcaption></figure>
+  </section>
+</main>
+<script>
+const canvas = document.getElementById('globe');
+const ctx = canvas.getContext('2d');
+const texture = new Image();
+texture.src = 'color.png';
+let texCanvas = document.createElement('canvas');
+let texCtx = texCanvas.getContext('2d');
+let texData = null;
+let angle = 0;
+texture.onload = () => {
+  texCanvas.width = texture.width;
+  texCanvas.height = texture.height;
+  texCtx.drawImage(texture, 0, 0);
+  texData = texCtx.getImageData(0, 0, texture.width, texture.height).data;
+  requestAnimationFrame(draw);
+};
+function sample(u, v) {
+  const x = ((u % texture.width) + texture.width) % texture.width;
+  const y = Math.max(0, Math.min(texture.height - 1, v));
+  const i = (y * texture.width + x) * 4;
+  return [texData[i], texData[i+1], texData[i+2]];
+}
+function draw() {
+  if (!texData) return;
+  const w = canvas.width, h = canvas.height, r = w * 0.43;
+  const image = ctx.createImageData(w, h);
+  const light = [-0.48, 0.36, 0.80];
+  for (let py = 0; py < h; py++) {
+    const sy = 1 - (py / (h - 1)) * 2;
+    for (let px = 0; px < w; px++) {
+      const sx = (px / (w - 1)) * 2 - 1;
+      const rr = sx*sx + sy*sy;
+      const idx = (py*w + px) * 4;
+      if (rr > 0.76) {
+        image.data[idx+3] = 255;
+        continue;
+      }
+      const z = Math.sqrt(0.76 - rr) / Math.sqrt(0.76);
+      const nx = sx / Math.sqrt(0.76), ny = sy / Math.sqrt(0.76), nz = z;
+      const lon = Math.atan2(nx, nz) + angle;
+      const lat = Math.asin(Math.max(-1, Math.min(1, ny)));
+      const u = Math.floor((lon + Math.PI) / (Math.PI * 2) * texture.width);
+      const v = Math.floor((Math.PI / 2 - lat) / Math.PI * texture.height);
+      const c = sample(u, v);
+      const shade = Math.max(0, nx*light[0] + ny*light[1] + nz*light[2]) * 0.95 + 0.16;
+      const rim = Math.max(0, Math.min(1, (1 - z) * 1.6));
+      image.data[idx] = Math.min(255, c[0] * shade + 50 * rim);
+      image.data[idx+1] = Math.min(255, c[1] * shade + 90 * rim);
+      image.data[idx+2] = Math.min(255, c[2] * shade + 135 * rim);
+      image.data[idx+3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  angle += 0.004;
+  requestAnimationFrame(draw);
+}
+</script>
+</body>
+</html>
